@@ -716,6 +716,8 @@ void setup() {
 // LOOP
 // =====================================================
 
+#ifndef KWTSOS_LOOP_DEFINED
+#define KWTSOS_LOOP_DEFINED
 void loop() {
   server.handleClient();
   MDNS.update();
@@ -734,3 +736,4 @@ void loop() {
     );
   }
 }
+#endif
