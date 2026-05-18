@@ -45,6 +45,13 @@ ESP8266WebServer server(80);
 #define EEPROM_SIZE  8
 #define EEPROM_MAGIC 0xAB
 
+// =====================================================
+// CALIBRATION  (set at declaration, overwritten by EEPROM)
+// =====================================================
+
+int dryVal = 800;   // raw ADC in dry air   (= 0%  moisture)
+int wetVal = 450;   // raw ADC in water      (= 100% moisture)
+
 void eepromSave() {
   EEPROM.put(0, dryVal);   // writes 2 bytes
   EEPROM.put(2, wetVal);   // writes 2 bytes
@@ -63,13 +70,6 @@ void eepromLoad() {
     // defaults already set at declaration
   }
 }
-
-// =====================================================
-// CALIBRATION  (set at declaration, overwritten by EEPROM)
-// =====================================================
-
-int dryVal = 800;   // raw ADC in dry air   (= 0%  moisture)
-int wetVal = 450;   // raw ADC in water      (= 100% moisture)
 
 // =====================================================
 // STATE
@@ -251,8 +251,11 @@ void handleData() {
   json += "\"wet\":"    + String(wetVal)         + ",";
   json += "\"plant\":"  + String(selectedPlant) + ",";
   json += "\"minM\":"   + String(plants[selectedPlant].minMoisture) + ",";
-  json += "\"ok\":"     + (sensorOK  ? F("true") : F("false")) + ",";
-  json += "\"pump\":"   + (pumpActive ? F("true") : F("false"));
+  json += "\"ok\":";
+  json += (sensorOK ? "true" : "false");
+  json += ",";
+  json += "\"pump\":";
+  json += (pumpActive ? "true" : "false");
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -264,10 +267,6 @@ void handleData() {
 // Call while sensor is in completely dry air / dry soil
 void handleCalibrateDry() {
   int sample = rawSample(20);   // more samples = more stable
-  if (sample <= 10 || sample >= 1010) {
-    server.send(400, "text/plain", "SENSOR_ERROR");
-    return;
-  }
   dryVal    = sample;
   smoothRaw = (float)sample;   // reset filter to avoid stale offset
   eepromSave();
@@ -278,10 +277,6 @@ void handleCalibrateDry() {
 // Call while sensor is fully submerged in water
 void handleCalibrateWet() {
   int sample = rawSample(20);
-  if (sample <= 10 || sample >= 1010) {
-    server.send(400, "text/plain", "SENSOR_ERROR");
-    return;
-  }
   wetVal    = sample;
   smoothRaw = (float)sample;
   eepromSave();
