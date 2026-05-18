@@ -1,0 +1,741 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <EEPROM.h>
+
+// =====================================================
+// WIFI
+// =====================================================
+
+const char* AP_NAME = "Kwtsos";
+const char* AP_PASS = "papagalos";
+
+// =====================================================
+// HARDWARE
+// =====================================================
+
+#define MOISTURE_PIN A0
+#define PUMP_PIN     D7   // GPIO13 -> RELAY
+
+// =====================================================
+// OLED
+// =====================================================
+
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// =====================================================
+// SERVER
+// =====================================================
+
+ESP8266WebServer server(80);
+
+// =====================================================
+// EEPROM LAYOUT
+// addr 0-1 : dryVal  (int, 2 bytes)
+// addr 2-3 : wetVal  (int, 2 bytes)
+// addr 4   : magic   (byte = 0xAB → valid data written)
+// =====================================================
+
+#define EEPROM_SIZE  8
+#define EEPROM_MAGIC 0xAB
+
+void eepromSave() {
+  EEPROM.put(0, dryVal);   // writes 2 bytes
+  EEPROM.put(2, wetVal);   // writes 2 bytes
+  EEPROM.write(4, EEPROM_MAGIC);
+  EEPROM.commit();
+  Serial.printf("[EEPROM] Saved  dry=%d  wet=%d\n", dryVal, wetVal);
+}
+
+void eepromLoad() {
+  if (EEPROM.read(4) == EEPROM_MAGIC) {
+    EEPROM.get(0, dryVal);
+    EEPROM.get(2, wetVal);
+    Serial.printf("[EEPROM] Loaded dry=%d  wet=%d\n", dryVal, wetVal);
+  } else {
+    Serial.println(F("[EEPROM] No saved calibration — using defaults"));
+    // defaults already set at declaration
+  }
+}
+
+// =====================================================
+// CALIBRATION  (set at declaration, overwritten by EEPROM)
+// =====================================================
+
+int dryVal = 800;   // raw ADC in dry air   (= 0%  moisture)
+int wetVal = 450;   // raw ADC in water      (= 100% moisture)
+
+// =====================================================
+// STATE
+// =====================================================
+
+int   moistureRaw = 0;
+int   moisturePct = 0;
+float smoothRaw   = 0.0f;
+bool  sensorOK    = true;
+
+bool          pumpActive   = false;
+unsigned long pumpStart    = 0;
+
+bool          manualMode     = false;
+unsigned long manualStart    = 0;
+unsigned long manualDuration = 0;
+
+unsigned long lastRead = 0;
+
+// =====================================================
+// PLANTS
+// =====================================================
+
+struct Plant {
+  const char* name;
+  const char* oledName;   // ASCII-safe for Adafruit GFX
+  const char* icon;
+  int         minMoisture;
+  int         maxWaterMin;
+};
+
+Plant plants[] = {
+  { "Tomata",    "Tomata",    "&#127813;", 60, 8  },
+  { "Vasilikos", "Vasilikos", "&#127807;", 55, 5  },
+  { "Elia",      "Elia",      "&#129386;", 25, 6  },
+  { "Piperia",   "Piperia",   "&#127798;", 55, 7  },
+  { "Marouli",   "Marouli",   "&#129388;", 65, 4  },
+  { "Aggouri",   "Aggouri",   "&#129388;", 70, 10 },
+  { "Thymari",   "Thymari",   "&#127807;", 20, 3  },
+  { "Rosemary",  "Rosemary",  "&#127807;", 20, 3  },
+};
+
+const int PLANT_COUNT = sizeof(plants) / sizeof(plants[0]);
+int selectedPlant = 0;
+
+// =====================================================
+// SENSOR
+// =====================================================
+
+// Take N samples quickly and return the average raw ADC
+int rawSample(int n = 10) {
+  long total = 0;
+  for (int i = 0; i < n; i++) {
+    total += analogRead(MOISTURE_PIN);
+    delay(5);
+  }
+  return (int)(total / n);
+}
+
+void readMoisture() {
+  moistureRaw = rawSample();
+  sensorOK    = (moistureRaw > 10 && moistureRaw < 1010);
+
+  if (sensorOK) {
+    smoothRaw   = (smoothRaw * 0.85f) + (moistureRaw * 0.15f);
+    int pct     = map((int)smoothRaw, dryVal, wetVal, 0, 100);
+    moisturePct = constrain(pct, 0, 100);
+  }
+}
+
+// =====================================================
+// PUMP LOGIC
+// =====================================================
+
+void controlPump() {
+  int minM = plants[selectedPlant].minMoisture;
+  unsigned long maxMs = (unsigned long)plants[selectedPlant].maxWaterMin * 60000UL;
+
+  if (!manualMode) {
+    if (!pumpActive && sensorOK && moisturePct < minM) {
+      pumpActive = true;
+      pumpStart  = millis();
+      digitalWrite(PUMP_PIN, HIGH);
+    }
+    if (pumpActive && (!sensorOK || moisturePct >= minM + 5)) {
+      pumpActive = false;
+      digitalWrite(PUMP_PIN, LOW);
+    }
+    if (pumpActive && (millis() - pumpStart >= maxMs)) {
+      pumpActive = false;
+      digitalWrite(PUMP_PIN, LOW);
+      Serial.println(F("[SAFETY] Pump stopped - max runtime reached"));
+    }
+  }
+
+  if (manualMode && (millis() - manualStart >= manualDuration)) {
+    manualMode = false;
+    pumpActive = false;
+    digitalWrite(PUMP_PIN, LOW);
+  }
+}
+
+// =====================================================
+// PUMP HELPERS
+// =====================================================
+
+void pumpOn() {
+  manualMode = false;
+  pumpActive = true;
+  pumpStart  = millis();
+  digitalWrite(PUMP_PIN, HIGH);
+}
+
+void pumpOff() {
+  manualMode = false;
+  pumpActive = false;
+  digitalWrite(PUMP_PIN, LOW);
+}
+
+void pumpTimer(int seconds) {
+  manualMode     = true;
+  manualStart    = millis();
+  manualDuration = (unsigned long)seconds * 1000UL;
+  pumpActive     = true;
+  pumpStart      = millis();
+  digitalWrite(PUMP_PIN, HIGH);
+}
+
+// =====================================================
+// OLED
+// =====================================================
+
+void updateOLED() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print(plants[selectedPlant].oledName);
+
+  if (!sensorOK) {
+    display.setTextSize(1);
+    display.setCursor(0, 18);
+    display.print("!! SENSOR ERROR !!");
+  } else {
+    display.setTextSize(2);
+    display.setCursor(0, 18);
+    display.print("Moist:");
+    display.print(moisturePct);
+    display.print("%");
+  }
+
+  display.setTextSize(1);
+  display.setCursor(0, 42);
+  display.print("D:");
+  display.print(dryVal);
+  display.setCursor(50, 42);
+  display.print("W:");
+  display.print(wetVal);
+  display.setCursor(95, 42);
+  display.print("R:");
+  display.print(moistureRaw);
+
+  display.setCursor(0, 56);
+  display.print(pumpActive ? "PUMP ON" : "PUMP OFF");
+
+  display.display();
+}
+
+// =====================================================
+// JSON DATA ENDPOINT
+// =====================================================
+
+void handleData() {
+  String json = "{";
+  json += "\"moist\":"  + String(moisturePct)  + ",";
+  json += "\"raw\":"    + String(moistureRaw)   + ",";
+  json += "\"dry\":"    + String(dryVal)         + ",";
+  json += "\"wet\":"    + String(wetVal)         + ",";
+  json += "\"plant\":"  + String(selectedPlant) + ",";
+  json += "\"minM\":"   + String(plants[selectedPlant].minMoisture) + ",";
+  json += "\"ok\":"     + (sensorOK  ? F("true") : F("false")) + ",";
+  json += "\"pump\":"   + (pumpActive ? F("true") : F("false"));
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// =====================================================
+// CALIBRATION HANDLERS
+// =====================================================
+
+// Call while sensor is in completely dry air / dry soil
+void handleCalibrateDry() {
+  int sample = rawSample(20);   // more samples = more stable
+  if (sample <= 10 || sample >= 1010) {
+    server.send(400, "text/plain", "SENSOR_ERROR");
+    return;
+  }
+  dryVal    = sample;
+  smoothRaw = (float)sample;   // reset filter to avoid stale offset
+  eepromSave();
+  Serial.printf("[CAL] New dry=%d\n", dryVal);
+  server.send(200, "text/plain", String(dryVal));
+}
+
+// Call while sensor is fully submerged in water
+void handleCalibrateWet() {
+  int sample = rawSample(20);
+  if (sample <= 10 || sample >= 1010) {
+    server.send(400, "text/plain", "SENSOR_ERROR");
+    return;
+  }
+  wetVal    = sample;
+  smoothRaw = (float)sample;
+  eepromSave();
+  Serial.printf("[CAL] New wet=%d\n", wetVal);
+  server.send(200, "text/plain", String(wetVal));
+}
+
+// Reset to factory defaults
+void handleCalibrateReset() {
+  dryVal = 800;
+  wetVal = 450;
+  smoothRaw = (float)rawSample();
+  eepromSave();
+  Serial.println(F("[CAL] Reset to defaults"));
+  server.send(200, "text/plain", "RESET");
+}
+
+// =====================================================
+// WEB HANDLERS
+// =====================================================
+
+void handlePumpOn()  { pumpOn();  server.send(200, "text/plain", "ON");  }
+void handlePumpOff() { pumpOff(); server.send(200, "text/plain", "OFF"); }
+
+void handlePumpTimer() {
+  int t = 10;
+  if (server.hasArg("t")) t = server.arg("t").toInt();
+  t = constrain(t, 1, 600);
+  pumpTimer(t);
+  server.send(200, "text/plain", "TIMER");
+}
+
+void handlePlantSelect() {
+  if (server.hasArg("id")) {
+    int id = server.arg("id").toInt();
+    if (id >= 0 && id < PLANT_COUNT) {
+      if (pumpActive && !manualMode) {
+        pumpActive = false;
+        digitalWrite(PUMP_PIN, LOW);
+      }
+      selectedPlant = id;
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+// =====================================================
+// WEB PAGE  (chunked to save heap)
+// =====================================================
+
+void handleRoot() {
+
+  String col = "#4ade80";
+  if      (!sensorOK)        col = "#a855f7";
+  else if (moisturePct < 20) col = "#f87171";
+  else if (moisturePct < 40) col = "#fb923c";
+  else if (moisturePct < 60) col = "#fbd34d";
+
+  const float CIRC   = 471.24f;
+  float       offset = sensorOK ? CIRC * (1.0f - moisturePct / 100.0f) : CIRC;
+
+  String pumpCls = pumpActive ? "on"          : "off";
+  String pumpTxt = pumpActive ? "Pump ACTIVE" : "Pump STOPPED";
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html; charset=utf-8", "");
+
+  // ── CHUNK 1: HEAD + CSS ─────────────────────────────────────
+  server.sendContent(F(
+    "<!DOCTYPE html><html><head>"
+    "<meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Kwtsos Farm</title>"
+    "<style>"
+    "*{box-sizing:border-box;margin:0;padding:0}"
+    "body{background:#080f0b;font-family:'Trebuchet MS',sans-serif;color:#d4f5dc;"
+      "min-height:100vh;padding:20px 16px;"
+      "background-image:radial-gradient(ellipse at 15% 0%,#0f2417 0%,transparent 55%),"
+        "radial-gradient(ellipse at 85% 100%,#0a1c10 0%,transparent 55%);}"
+    ".wrap{max-width:440px;margin:auto}"
+    // header
+    ".hdr{display:flex;align-items:baseline;gap:10px;margin-bottom:4px}"
+    "h1{font-family:Georgia,serif;font-size:38px;font-style:italic;color:#4ade80;letter-spacing:2px;line-height:1}"
+    ".badge{background:#0d2b17;border:1px solid #1e4228;color:#4ade80;font-size:9px;"
+      "letter-spacing:2px;text-transform:uppercase;padding:3px 9px;border-radius:99px}"
+    ".sub{font-size:10px;color:#3a6647;letter-spacing:3px;text-transform:uppercase;margin-bottom:16px}"
+    // plant grid
+    ".plants{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px}"
+    ".pb{border:1.5px solid #1a3322;background:transparent;color:#3a6647;"
+      "border-radius:12px;font-family:'Trebuchet MS',sans-serif;"
+      "font-size:11px;font-weight:bold;cursor:pointer;"
+      "transition:all .2s;display:flex;flex-direction:column;"
+      "align-items:center;gap:3px;padding:8px 2px}"
+    ".pb .nm{text-align:center;word-break:break-word;line-height:1.2}"
+    ".pb .thr{font-size:9px;font-weight:normal;color:#2a5035;margin-top:1px}"
+    ".pb.active{border-color:#4ade80;color:#4ade80;"
+      "background:rgba(74,222,128,.07);box-shadow:0 0 12px rgba(74,222,128,.06)}"
+    ".pb.active .thr{color:#2d7a42}"
+    // cards
+    ".gcard,.ccard,.calcard{background:#0c1a11;border:1px solid #1a3322;"
+      "border-radius:20px;padding:18px 14px 12px;margin-bottom:12px;text-align:center}"
+    ".ccard,.calcard{text-align:left}"
+    "svg.ring{display:block;margin:auto}"
+    "#arc{transition:stroke-dashoffset 1.2s ease,stroke .6s}"
+    // pill
+    ".pill{display:inline-flex;align-items:center;gap:8px;"
+      "padding:7px 18px;border-radius:99px;font-size:13px;font-weight:bold;margin-top:10px}"
+    ".pill.on{background:rgba(74,222,128,.1);color:#4ade80;border:1px solid rgba(74,222,128,.25)}"
+    ".pill.off{background:rgba(251,146,60,.07);color:#fb923c;border:1px solid rgba(251,146,60,.2)}"
+    ".pill.err{background:rgba(168,85,247,.1);color:#a855f7;border:1px solid rgba(168,85,247,.25)}"
+    ".dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}"
+    ".dot.on{background:#4ade80;box-shadow:0 0 6px #4ade80;animation:pulse 1.4s infinite}"
+    ".dot.off{background:#fb923c}"
+    ".dot.err{background:#a855f7;box-shadow:0 0 6px #a855f7;animation:pulse 1s infinite}"
+    "@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}"
+    // buttons
+    ".clabel{font-size:10px;letter-spacing:2.5px;color:#3a6647;"
+      "text-transform:uppercase;margin-bottom:12px}"
+    ".btns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}"
+    ".btn{padding:14px 8px;border:none;border-radius:13px;"
+      "font-family:'Trebuchet MS',sans-serif;font-size:13px;font-weight:bold;"
+      "cursor:pointer;transition:transform .12s,opacity .2s;width:100%}"
+    ".btn:active{transform:scale(.96);opacity:.75}"
+    ".btn-on{background:#4ade80;color:#061009}"
+    ".btn-off{background:#111f15;color:#f87171;border:1.5px solid rgba(248,113,113,.2)}"
+    // calibration buttons
+    ".cal-btns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}"
+    ".btn-dry{background:#111508;color:#a3e635;border:1.5px solid rgba(163,230,53,.25);"
+      "padding:12px 8px;border-radius:13px;font-family:'Trebuchet MS',sans-serif;"
+      "font-size:13px;font-weight:bold;cursor:pointer;transition:transform .12s}"
+    ".btn-wet{background:#081018;color:#38bdf8;border:1.5px solid rgba(56,189,248,.25);"
+      "padding:12px 8px;border-radius:13px;font-family:'Trebuchet MS',sans-serif;"
+      "font-size:13px;font-weight:bold;cursor:pointer;transition:transform .12s}"
+    ".btn-dry:active,.btn-wet:active{transform:scale(.96)}"
+    ".btn-rst{background:transparent;color:#3a6647;border:1.5px solid #1a3322;"
+      "padding:8px;border-radius:10px;font-family:'Trebuchet MS',sans-serif;"
+      "font-size:11px;cursor:pointer;width:100%;margin-top:4px;transition:transform .12s}"
+    ".btn-rst:active{transform:scale(.97)}"
+    // cal values bar
+    ".calbar{display:flex;gap:8px;margin-bottom:10px}"
+    ".calval{flex:1;background:#080f0b;border:1px solid #111d15;border-radius:10px;"
+      "padding:8px 10px;text-align:center}"
+    ".calval .lbl{font-size:9px;letter-spacing:2px;color:#2a4a33;text-transform:uppercase}"
+    ".calval .num{font-size:20px;font-family:Georgia,serif;font-style:italic;"
+      "color:#3a6647;margin-top:2px}"
+    ".calval.active-dry .num{color:#a3e635}"
+    ".calval.active-wet .num{color:#38bdf8}"
+    // cal hint
+    ".hint{font-size:10px;color:#2a4a33;margin-top:8px;line-height:1.5;text-align:center}"
+    // timer row
+    ".trow{display:flex;gap:8px}"
+    ".trow input{flex:1;background:#080f0b;border:1.5px solid #1a3322;"
+      "border-radius:11px;color:#d4f5dc;padding:12px 14px;"
+      "font-family:'Trebuchet MS',sans-serif;font-size:13px}"
+    ".trow input:focus{outline:none;border-color:#4ade80}"
+    ".trow input::placeholder{color:#2a4a33}"
+    ".btn-t{background:#0a1d2a;color:#38bdf8;border:1.5px solid rgba(56,189,248,.2);"
+      "border-radius:11px;padding:12px 14px;"
+      "font-family:'Trebuchet MS',sans-serif;font-size:13px;font-weight:bold;"
+      "cursor:pointer;white-space:nowrap;transition:transform .12s}"
+    ".btn-t:active{transform:scale(.96)}"
+    ".note{text-align:center;font-size:11px;color:#2a5035;margin-top:12px}"
+    // raw bar
+    ".rawbar{display:flex;justify-content:space-between;margin-top:12px;"
+      "padding:9px 14px;background:#080f0b;border:1px solid #111d15;"
+      "border-radius:12px;font-size:9px;color:#1e3a24;"
+      "letter-spacing:1px;text-transform:uppercase}"
+    ".warn{color:#a855f7!important}"
+    // flash overlay for cal feedback
+    "#flash{position:fixed;top:16px;left:50%;transform:translateX(-50%);"
+      "padding:10px 22px;border-radius:99px;font-size:13px;font-weight:bold;"
+      "opacity:0;transition:opacity .3s;pointer-events:none;z-index:99}"
+    "</style></head><body><div class='wrap'>"
+  ));
+
+  // ── CHUNK 2: HEADER ─────────────────────────────────────────
+  server.sendContent(F(
+    "<div id='flash'></div>"
+    "<div class='hdr'><h1>Kwtsos</h1>"
+    "<span class='badge'>LIVE</span></div>"
+    "<div class='sub'>Smart Irrigation System</div>"
+  ));
+
+  // ── CHUNK 3: PLANT BUTTONS ───────────────────────────────────
+  {
+    String pb = "<div class='plants'>";
+    for (int i = 0; i < PLANT_COUNT; i++) {
+      pb += "<button class='pb";
+      if (i == selectedPlant) pb += " active";
+      pb += "' onclick='selp(" + String(i) + ")'>";
+      pb += "<span class='nm'>" + String(plants[i].name) + "</span>";
+      pb += "<span class='thr'>min " + String(plants[i].minMoisture) + "%</span>";
+      pb += "</button>";
+    }
+    pb += "</div>";
+    server.sendContent(pb);
+  }
+
+  // ── CHUNK 4: GAUGE ───────────────────────────────────────────
+  {
+    String gc = "<div class='gcard'>";
+    gc += "<svg class='ring' width='180' height='180' viewBox='0 0 180 180'>";
+    gc += "<circle cx='90' cy='90' r='72' fill='none' stroke='#0f2418' stroke-width='12'/>";
+    gc += "<circle id='arc' cx='90' cy='90' r='72' fill='none'"
+          " stroke='" + col + "' stroke-width='12'"
+          " stroke-dasharray='" + String(CIRC) + "'"
+          " stroke-dashoffset='" + String(offset) + "'"
+          " stroke-linecap='round' transform='rotate(-90 90 90)'/>";
+    gc += "<text id='pct' x='90' y='83' text-anchor='middle'"
+          " fill='" + col + "'"
+          " font-family='Georgia,serif' font-size='44' font-style='italic'>";
+    gc += sensorOK ? (String(moisturePct) + "%") : String("---");
+    gc += "</text>";
+    gc += "<text x='90' y='104' text-anchor='middle' fill='#3a6647'"
+          " font-family='Trebuchet MS,sans-serif' font-size='9' letter-spacing='3'>MOISTURE</text>";
+    gc += "<text id='gname' x='90' y='120' text-anchor='middle' fill='#1e4228'"
+          " font-family='Trebuchet MS,sans-serif' font-size='9'>";
+    gc += plants[selectedPlant].name;
+    gc += "</text>";
+    gc += "</svg>";
+
+    String cls = sensorOK ? pumpCls : "err";
+    String txt = sensorOK ? pumpTxt : "Sensor Error";
+    gc += "<div><span class='pill " + cls + "' id='pill'>";
+    gc += "<span class='dot " + cls + "' id='dot'></span>";
+    gc += "<span id='pstatus'>" + txt + "</span>";
+    gc += "</span></div>";
+    gc += "</div>"; // .gcard
+    server.sendContent(gc);
+  }
+
+  // ── CHUNK 5: CALIBRATION CARD ────────────────────────────────
+  {
+    String cc = "<div class='calcard'>";
+    cc += "<div class='clabel'>Sensor Calibration</div>";
+
+    // current dry / wet / raw values
+    cc += "<div class='calbar'>";
+    cc += "<div class='calval' id='cv-dry'><div class='lbl'>DRY</div><div class='num' id='cv-dry-n'>" + String(dryVal) + "</div></div>";
+    cc += "<div class='calval' id='cv-raw'><div class='lbl'>RAW NOW</div><div class='num' id='cv-raw-n'>" + String(moistureRaw) + "</div></div>";
+    cc += "<div class='calval' id='cv-wet'><div class='lbl'>WET</div><div class='num' id='cv-wet-n'>" + String(wetVal) + "</div></div>";
+    cc += "</div>";
+
+    // calibration buttons
+    cc += "<div class='cal-btns'>";
+    cc += "<button class='btn-dry' onclick='calDry()'>&#9729; Set as DRY</button>";
+    cc += "<button class='btn-wet' onclick='calWet()'>&#128167; Set as WET</button>";
+    cc += "</div>";
+    cc += "<button class='btn-rst' onclick='calReset()'>&#8635; Reset to defaults (800 / 450)</button>";
+
+    cc += "<div class='hint'>HOW TO:<br>";
+    cc += "1. Hold sensor in open air &rarr; press SET DRY<br>";
+    cc += "2. Submerge sensor tip in water &rarr; press SET WET<br>";
+    cc += "Saved to EEPROM &mdash; survives reboot.</div>";
+
+    cc += "</div>"; // .calcard
+    server.sendContent(cc);
+  }
+
+  // ── CHUNK 6: PUMP CONTROLS ───────────────────────────────────
+  server.sendContent(F(
+    "<div class='ccard'>"
+    "<div class='clabel'>Pump Control</div>"
+    "<div class='btns'>"
+    "<button class='btn btn-on' onclick=\"cmd('/pump/on')\">&#128167; Pump ON</button>"
+    "<button class='btn btn-off' onclick=\"cmd('/pump/off')\">&#128721; Pump OFF</button>"
+    "</div>"
+    "<div class='trow'>"
+    "<input id='t' type='number' min='1' max='600' placeholder='Duration in seconds...'>"
+    "<button class='btn-t' onclick=\"cmd('/pump/timer?t='+document.getElementById('t').value)\">"
+      "&#9201; Timer</button>"
+    "</div>"
+  ));
+
+  // ── CHUNK 7: NOTE + RAW BAR ──────────────────────────────────
+  {
+    String tail = "<div class='note' id='note'>Auto-water when moisture &lt; <b>";
+    tail += plants[selectedPlant].minMoisture;
+    tail += "%</b> &bull; Plant: ";
+    tail += plants[selectedPlant].name;
+    tail += "</div></div>"; // .note + .ccard
+
+    tail += "<div class='rawbar'>";
+    tail += "<span id='rawv'" + String(!sensorOK ? " class='warn'" : "") + ">RAW " + String(moistureRaw) + "</span>";
+    tail += "<span>DRY " + String(dryVal) + "</span>";
+    tail += "<span>WET " + String(wetVal) + "</span>";
+    tail += "</div>";
+    tail += "</div>"; // .wrap
+    server.sendContent(tail);
+  }
+
+  // ── CHUNK 8: JS — dynamic arrays ────────────────────────────
+  {
+    String js = "<script>const MINS=[";
+    for (int i = 0; i < PLANT_COUNT; i++) {
+      js += plants[i].minMoisture;
+      if (i < PLANT_COUNT - 1) js += ",";
+    }
+    js += "];const NAMES=[";
+    for (int i = 0; i < PLANT_COUNT; i++) {
+      js += "'";
+      js += plants[i].name;
+      js += "'";
+      if (i < PLANT_COUNT - 1) js += ",";
+    }
+    js += "];";
+    server.sendContent(js);
+  }
+
+  // ── CHUNK 9: JS — static logic ──────────────────────────────
+  server.sendContent(F(
+    "const CIRC=471.24;"
+
+    // generic fetch + refresh
+    "async function cmd(u){await fetch(u);ref();}"
+
+    // flash notification
+    "function flash(msg,col){"
+      "let f=document.getElementById('flash');"
+      "f.textContent=msg;"
+      "f.style.background=col||'#1a3322';"
+      "f.style.color='#4ade80';"
+      "f.style.opacity='1';"
+      "setTimeout(()=>f.style.opacity='0',2200);"
+    "}"
+
+    // plant selector
+    "async function selp(id){"
+      "document.querySelectorAll('.pb').forEach((b,i)=>{"
+        "b.className='pb'+(i===id?' active':'');"
+      "});"
+      "document.getElementById('gname').textContent=NAMES[id];"
+      "document.getElementById('note').innerHTML="
+        "'Auto-water when moisture &lt; <b>'+MINS[id]+'%</b> &bull; Plant: '+NAMES[id];"
+      "await fetch('/plant?id='+id);"
+    "}"
+
+    // calibration
+    "async function calDry(){"
+      "let r=await fetch('/calibrate/dry');"
+      "if(r.ok){let v=await r.text();"
+        "document.getElementById('cv-dry-n').textContent=v;"
+        "flash('DRY saved: '+v,'#0f2010');"
+        "ref();"
+      "}else flash('Sensor error!','#1a0808');"
+    "}"
+    "async function calWet(){"
+      "let r=await fetch('/calibrate/wet');"
+      "if(r.ok){let v=await r.text();"
+        "document.getElementById('cv-wet-n').textContent=v;"
+        "flash('WET saved: '+v,'#080e18');"
+        "ref();"
+      "}else flash('Sensor error!','#1a0808');"
+    "}"
+    "async function calReset(){"
+      "await fetch('/calibrate/reset');"
+      "document.getElementById('cv-dry-n').textContent='800';"
+      "document.getElementById('cv-wet-n').textContent='450';"
+      "flash('Reset to defaults','#111111');"
+      "ref();"
+    "}"
+
+    // update all live elements
+    "function setData(d){"
+      "let ok=d.ok;"
+      "let c=!ok?'#a855f7':d.moist<20?'#f87171':d.moist<40?'#fb923c':d.moist<60?'#fbd34d':'#4ade80';"
+      "let arc=document.getElementById('arc');"
+      "arc.style.strokeDashoffset=ok?CIRC*(1-d.moist/100):CIRC;"
+      "arc.style.stroke=c;"
+      "let pt=document.getElementById('pct');"
+      "pt.textContent=ok?d.moist+'%':'---';"
+      "pt.style.fill=c;"
+      "let cls=ok?(d.pump?'on':'off'):'err';"
+      "let txt=ok?(d.pump?'Pump ACTIVE':'Pump STOPPED'):'Sensor Error';"
+      "document.getElementById('pill').className='pill '+cls;"
+      "document.getElementById('dot').className='dot '+cls;"
+      "document.getElementById('pstatus').textContent=txt;"
+      // update raw bars
+      "document.getElementById('cv-raw-n').textContent=d.raw;"
+      "document.getElementById('cv-dry-n').textContent=d.dry;"
+      "document.getElementById('cv-wet-n').textContent=d.wet;"
+      "let rv=document.getElementById('rawv');"
+      "rv.textContent='RAW '+d.raw;"
+      "rv.className=ok?'':'warn';"
+    "}"
+
+    "async function ref(){"
+      "try{let r=await fetch('/data');let d=await r.json();setData(d);}catch(e){}"
+    "}"
+    "ref();setInterval(ref,2000);"
+    "</script></body></html>"
+  ));
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
+
+  Wire.begin(12, 14);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+
+  EEPROM.begin(EEPROM_SIZE);
+  eepromLoad();   // overwrite defaults with saved calibration if present
+
+  // Seed smoothing filter with real reading after calibration is loaded
+  smoothRaw = (float)analogRead(MOISTURE_PIN);
+
+  WiFi.softAP(AP_NAME, AP_PASS);
+  MDNS.begin("kwtsos");
+
+  server.on("/",                handleRoot);
+  server.on("/data",            handleData);
+  server.on("/plant",           handlePlantSelect);
+  server.on("/pump/on",         handlePumpOn);
+  server.on("/pump/off",        handlePumpOff);
+  server.on("/pump/timer",      handlePumpTimer);
+  server.on("/calibrate/dry",   handleCalibrateDry);
+  server.on("/calibrate/wet",   handleCalibrateWet);
+  server.on("/calibrate/reset", handleCalibrateReset);
+
+  server.begin();
+
+  Serial.println(F("\n=== Kwtsos Smart Farm ==="));
+  Serial.printf("AP: %s  IP: %s  Plants: %d\n",
+    AP_NAME, WiFi.softAPIP().toString().c_str(), PLANT_COUNT);
+  Serial.printf("Calibration: dry=%d  wet=%d\n", dryVal, wetVal);
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+  server.handleClient();
+  MDNS.update();
+
+  if (millis() - lastRead > 2000) {
+    lastRead = millis();
+    readMoisture();
+    controlPump();
+    updateOLED();
+
+    Serial.printf("[%s] Moisture: %d%% (raw:%d dry:%d wet:%d) | Pump: %s%s\n",
+      plants[selectedPlant].oledName,
+      moisturePct, moistureRaw, dryVal, wetVal,
+      pumpActive ? "ON"  : "OFF",
+      sensorOK   ? ""    : " *** SENSOR ERROR ***"
+    );
+  }
+}
