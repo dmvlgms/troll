@@ -267,10 +267,6 @@ void handleData() {
 // Call while sensor is in completely dry air / dry soil
 void handleCalibrateDry() {
   int sample = rawSample(20);   // more samples = more stable
-  if (sample <= 10 || sample >= 1010) {
-    server.send(400, "text/plain", "SENSOR_ERROR");
-    return;
-  }
   dryVal    = sample;
   smoothRaw = (float)sample;   // reset filter to avoid stale offset
   eepromSave();
@@ -281,10 +277,6 @@ void handleCalibrateDry() {
 // Call while sensor is fully submerged in water
 void handleCalibrateWet() {
   int sample = rawSample(20);
-  if (sample <= 10 || sample >= 1010) {
-    server.send(400, "text/plain", "SENSOR_ERROR");
-    return;
-  }
   wetVal    = sample;
   smoothRaw = (float)sample;
   eepromSave();
