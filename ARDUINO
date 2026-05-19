@@ -49,8 +49,8 @@ ESP8266WebServer server(80);
 // CALIBRATION  (set at declaration, overwritten by EEPROM)
 // =====================================================
 
-int dryVal = 800;   // raw ADC in dry air   (= 0%  moisture)
-int wetVal = 450;   // raw ADC in water      (= 100% moisture)
+int dryVal = 1024;  // raw ADC in dry air   (= 0%  moisture)
+int wetVal = 294;   // raw ADC in water      (= 100% moisture)
 
 void eepromSave() {
   EEPROM.put(0, dryVal);   // writes 2 bytes
@@ -286,8 +286,8 @@ void handleCalibrateWet() {
 
 // Reset to factory defaults
 void handleCalibrateReset() {
-  dryVal = 800;
-  wetVal = 450;
+  dryVal = 1024;
+  wetVal = 294;
   smoothRaw = (float)rawSample();
   eepromSave();
   Serial.println(F("[CAL] Reset to defaults"));
@@ -525,7 +525,7 @@ void handleRoot() {
     cc += "<button class='btn-dry' onclick='calDry()'>&#9729; Set as DRY</button>";
     cc += "<button class='btn-wet' onclick='calWet()'>&#128167; Set as WET</button>";
     cc += "</div>";
-    cc += "<button class='btn-rst' onclick='calReset()'>&#8635; Reset to defaults (800 / 450)</button>";
+    cc += "<button class='btn-rst' onclick='calReset()'>&#8635; Reset to defaults (1024 / 294)</button>";
 
     cc += "<div class='hint'>HOW TO:<br>";
     cc += "1. Hold sensor in open air &rarr; press SET DRY<br>";
@@ -633,8 +633,8 @@ void handleRoot() {
     "}"
     "async function calReset(){"
       "await fetch('/calibrate/reset');"
-      "document.getElementById('cv-dry-n').textContent='800';"
-      "document.getElementById('cv-wet-n').textContent='450';"
+      "document.getElementById('cv-dry-n').textContent='1024';"
+      "document.getElementById('cv-wet-n').textContent='294';"
       "flash('Reset to defaults','#111111');"
       "ref();"
     "}"
