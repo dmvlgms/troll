@@ -82,6 +82,7 @@ bool  sensorOK    = true;
 
 bool          pumpActive   = false;
 unsigned long pumpStart    = 0;
+unsigned long pumpPauseUntil = 0;
 
 bool          manualMode     = false;
 unsigned long manualStart    = 0;
@@ -146,22 +147,30 @@ void readMoisture() {
 
 void controlPump() {
   int minM = plants[selectedPlant].minMoisture;
-  unsigned long maxMs = (unsigned long)plants[selectedPlant].maxWaterMin * 60000UL;
+
+  // Auto-watering happens in short pulses to avoid overwatering.
+  const unsigned long autoPulseOnMs  = 6000UL;   // 6s ON
+  const unsigned long autoPulseOffMs = 25000UL;  // 25s soak/pause
 
   if (!manualMode) {
-    if (!pumpActive && sensorOK && moisturePct < minM) {
+    unsigned long now = millis();
+
+    if (!pumpActive && sensorOK && moisturePct < minM && now >= pumpPauseUntil) {
       pumpActive = true;
-      pumpStart  = millis();
+      pumpStart  = now;
       digitalWrite(PUMP_PIN, HIGH);
     }
-    if (pumpActive && (!sensorOK || moisturePct >= minM + 5)) {
-      pumpActive = false;
-      digitalWrite(PUMP_PIN, LOW);
-    }
-    if (pumpActive && (millis() - pumpStart >= maxMs)) {
-      pumpActive = false;
-      digitalWrite(PUMP_PIN, LOW);
-      Serial.println(F("[SAFETY] Pump stopped - max runtime reached"));
+
+    if (pumpActive) {
+      if (!sensorOK || moisturePct >= minM + 5) {
+        pumpActive = false;
+        pumpPauseUntil = now + autoPulseOffMs;
+        digitalWrite(PUMP_PIN, LOW);
+      } else if (now - pumpStart >= autoPulseOnMs) {
+        pumpActive = false;
+        pumpPauseUntil = now + autoPulseOffMs;
+        digitalWrite(PUMP_PIN, LOW);
+      }
     }
   }
 
@@ -178,6 +187,7 @@ void controlPump() {
 
 void pumpOn() {
   manualMode = false;
+  pumpPauseUntil = 0;
   pumpActive = true;
   pumpStart  = millis();
   digitalWrite(PUMP_PIN, HIGH);
@@ -185,11 +195,13 @@ void pumpOn() {
 
 void pumpOff() {
   manualMode = false;
+  pumpPauseUntil = 0;
   pumpActive = false;
   digitalWrite(PUMP_PIN, LOW);
 }
 
 void pumpTimer(int seconds) {
+  pumpPauseUntil = 0;
   manualMode     = true;
   manualStart    = millis();
   manualDuration = (unsigned long)seconds * 1000UL;
