@@ -4,7 +4,6 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <EEPROM.h>
 
 // =====================================================
 // WIFI
@@ -36,43 +35,15 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 ESP8266WebServer server(80);
 
 // =====================================================
-// EEPROM LAYOUT
-// addr 0-1 : dryVal  (int, 2 bytes)
-// addr 2-3 : wetVal  (int, 2 bytes)
-// addr 4   : magic   (byte = 0xAB → valid data written)
+// CALIBRATION — always resets to these on every boot
+// Calibration changed via web UI is session-only
 // =====================================================
 
-#define EEPROM_SIZE  8
-#define EEPROM_MAGIC 0xAB
+int dryVal = 1024;   // raw ADC in dry air  (= 0%  moisture)
+int wetVal = 294;    // raw ADC in water     (= 100% moisture)
 
 // =====================================================
-// CALIBRATION  (set at declaration, overwritten by EEPROM)
-// =====================================================
-
-int dryVal = 1024;  // raw ADC in dry air   (= 0%  moisture)
-int wetVal = 294;   // raw ADC in water      (= 100% moisture)
-
-void eepromSave() {
-  EEPROM.put(0, dryVal);   // writes 2 bytes
-  EEPROM.put(2, wetVal);   // writes 2 bytes
-  EEPROM.write(4, EEPROM_MAGIC);
-  EEPROM.commit();
-  Serial.printf("[EEPROM] Saved  dry=%d  wet=%d\n", dryVal, wetVal);
-}
-
-void eepromLoad() {
-  if (EEPROM.read(4) == EEPROM_MAGIC) {
-    EEPROM.get(0, dryVal);
-    EEPROM.get(2, wetVal);
-    Serial.printf("[EEPROM] Loaded dry=%d  wet=%d\n", dryVal, wetVal);
-  } else {
-    Serial.println(F("[EEPROM] No saved calibration — using defaults"));
-    // defaults already set at declaration
-  }
-}
-
-// =====================================================
-// STATE
+// SENSOR STATE
 // =====================================================
 
 int   moistureRaw = 0;
@@ -80,13 +51,68 @@ int   moisturePct = 0;
 float smoothRaw   = 0.0f;
 bool  sensorOK    = true;
 
-bool          pumpActive   = false;
-unsigned long pumpStart    = 0;
+// =====================================================
+// PUMP TIMING CONFIG
+// =====================================================
+
+const unsigned long FIRST_PULSE_MS  = 10000UL;         // 10 s  — initial watering burst
+const unsigned long SECOND_PULSE_MS =  5000UL;         //  5 s  — follow-up top-up burst
+const unsigned long SOAK_MIN_MS     = 20UL * 60000UL;  // 20 min soak (minimum)
+const unsigned long SOAK_MAX_MS     = 30UL * 60000UL;  // 30 min soak (maximum, randomised)
+const unsigned long POST_SECOND_MS  = 25UL * 60000UL;  // cooldown after 2nd pulse
+
+// =====================================================
+// PUMP STATE
+// =====================================================
+
+bool          pumpActive     = false;
+unsigned long pumpStart      = 0;
 unsigned long pumpPauseUntil = 0;
+
+// 0 = fresh cycle  → next ON burst is 10 s (first pulse)
+// 1 = after first  → next ON burst is  5 s (follow-up pulse)
+int waterCycle = 0;
 
 bool          manualMode     = false;
 unsigned long manualStart    = 0;
 unsigned long manualDuration = 0;
+
+// =====================================================
+// WORKING-TIME TRACKER
+// =====================================================
+
+unsigned long pumpTotalOnMs   = 0;   // accumulated pump-ON time (ms)
+unsigned long pumpOnStartedAt = 0;   // millis() when current ON period began
+
+// Call whenever the pump turns OFF to credit the elapsed ON time
+void pumpTimeAccumulate() {
+  if (pumpOnStartedAt > 0) {
+    pumpTotalOnMs  += millis() - pumpOnStartedAt;
+    pumpOnStartedAt = 0;
+  }
+}
+
+// Total seconds the pump has been ON (including current session if still running)
+unsigned long totalPumpSeconds() {
+  unsigned long ms = pumpTotalOnMs;
+  if (pumpActive && pumpOnStartedAt > 0)
+    ms += millis() - pumpOnStartedAt;
+  return ms / 1000UL;
+}
+
+String formatTime(unsigned long secs) {
+  unsigned long h = secs / 3600;
+  unsigned long m = (secs % 3600) / 60;
+  unsigned long s = secs % 60;
+  char buf[20];
+  if (h > 0) snprintf(buf, sizeof(buf), "%luh %02lum %02lus", h, m, s);
+  else        snprintf(buf, sizeof(buf), "%lum %02lus", m, s);
+  return String(buf);
+}
+
+// =====================================================
+// MISC STATE
+// =====================================================
 
 unsigned long lastRead = 0;
 
@@ -96,7 +122,7 @@ unsigned long lastRead = 0;
 
 struct Plant {
   const char* name;
-  const char* oledName;   // ASCII-safe for Adafruit GFX
+  const char* oledName;
   const char* icon;
   int         minMoisture;
   int         maxWaterMin;
@@ -120,7 +146,6 @@ int selectedPlant = 0;
 // SENSOR
 // =====================================================
 
-// Take N samples quickly and return the average raw ADC
 int rawSample(int n = 10) {
   long total = 0;
   for (int i = 0; i < n; i++) {
@@ -142,72 +167,150 @@ void readMoisture() {
 }
 
 // =====================================================
-// PUMP LOGIC
+// LOW-LEVEL PUMP SWITCH  (always go through these)
 // =====================================================
 
-void controlPump() {
-  int minM = plants[selectedPlant].minMoisture;
-
-  // Auto-watering happens in short pulses to avoid overwatering.
-  const unsigned long autoPulseOnMs  = 6000UL;   // 6s ON
-  const unsigned long autoPulseOffMs = 25000UL;  // 25s soak/pause
-
-  if (!manualMode) {
-    unsigned long now = millis();
-
-    if (!pumpActive && sensorOK && moisturePct < minM && now >= pumpPauseUntil) {
-      pumpActive = true;
-      pumpStart  = now;
-      digitalWrite(PUMP_PIN, HIGH);
-    }
-
-    if (pumpActive) {
-      if (!sensorOK || moisturePct >= minM + 5) {
-        pumpActive = false;
-        pumpPauseUntil = now + autoPulseOffMs;
-        digitalWrite(PUMP_PIN, LOW);
-      } else if (now - pumpStart >= autoPulseOnMs) {
-        pumpActive = false;
-        pumpPauseUntil = now + autoPulseOffMs;
-        digitalWrite(PUMP_PIN, LOW);
-      }
-    }
+void _pumpOn() {
+  if (!pumpActive) {
+    pumpActive      = true;
+    pumpStart       = millis();
+    pumpOnStartedAt = millis();
+    digitalWrite(PUMP_PIN, HIGH);
   }
+}
 
-  if (manualMode && (millis() - manualStart >= manualDuration)) {
-    manualMode = false;
+void _pumpOff() {
+  if (pumpActive) {
+    pumpTimeAccumulate();
     pumpActive = false;
     digitalWrite(PUMP_PIN, LOW);
   }
 }
 
 // =====================================================
-// PUMP HELPERS
+// AUTO PUMP LOGIC
+//
+//  Cycle 0  → pump ON for 10 s (first burst)
+//             → pause 20–30 min (random soak)
+//  Cycle 1  → if moisture still low: pump ON 5 s (top-up)
+//             → pause 25 min cooldown, reset to cycle 0
+//  At any point: if moisture rises above (minM + 5) pump stops early
+// =====================================================
+
+void controlPump() {
+  unsigned long now = millis();
+
+  // ── Manual-timer override ─────────────────────────────────
+  if (manualMode) {
+    if (now - manualStart >= manualDuration) {
+      manualMode = false;
+      _pumpOff();
+    }
+    return;
+  }
+
+  // ── Auto mode ─────────────────────────────────────────────
+  int minM = plants[selectedPlant].minMoisture;
+
+  if (pumpActive) {
+    unsigned long elapsed  = now - pumpStart;
+    unsigned long pulseLen = (waterCycle == 0) ? FIRST_PULSE_MS : SECOND_PULSE_MS;
+
+    bool stopNow = !sensorOK
+                || (moisturePct >= minM + 5)   // soil absorbed enough
+                || (elapsed    >= pulseLen);    // time limit reached
+
+    if (stopNow) {
+      _pumpOff();
+
+      if (waterCycle == 0) {
+        // First 10-s burst complete → soak 20-30 min then follow-up
+        waterCycle = 1;
+        unsigned long soak = SOAK_MIN_MS
+                           + (unsigned long)random(0L, (long)(SOAK_MAX_MS - SOAK_MIN_MS));
+        pumpPauseUntil = now + soak;
+        Serial.printf("[PUMP] 1st burst done. Soaking %lu min before follow-up.\n",
+                      soak / 60000UL);
+      } else {
+        // Follow-up 5-s burst complete → long cooldown, fresh cycle
+        waterCycle     = 0;
+        pumpPauseUntil = now + POST_SECOND_MS;
+        Serial.println(F("[PUMP] Follow-up done. 25-min cooldown. Cycle reset."));
+      }
+    }
+    return;
+  }
+
+  // Pump is currently OFF ─────────────────────────────────────
+  if (!sensorOK)           return;   // sensor fault — don't water
+  if (now < pumpPauseUntil) return;  // still in soak / cooldown
+
+  if (moisturePct >= minM) {
+    // Soil is fine — if soak period just ended, reset cycle
+    if (waterCycle == 1) {
+      waterCycle = 0;
+      Serial.println(F("[PUMP] Soak done, moisture OK. Cycle reset."));
+    }
+    return;
+  }
+
+  // Moisture still below threshold → trigger next burst
+  Serial.printf("[PUMP] Moisture %d%% < %d%% — starting %s burst\n",
+    moisturePct, minM, waterCycle == 0 ? "10s first" : "5s follow-up");
+  _pumpOn();
+}
+
+// =====================================================
+// PUMP HELPERS  (web / manual commands)
 // =====================================================
 
 void pumpOn() {
-  manualMode = false;
+  manualMode     = false;
   pumpPauseUntil = 0;
-  pumpActive = true;
-  pumpStart  = millis();
-  digitalWrite(PUMP_PIN, HIGH);
+  waterCycle     = 0;
+  _pumpOn();
 }
 
 void pumpOff() {
-  manualMode = false;
+  manualMode     = false;
   pumpPauseUntil = 0;
-  pumpActive = false;
-  digitalWrite(PUMP_PIN, LOW);
+  _pumpOff();
 }
 
 void pumpTimer(int seconds) {
-  pumpPauseUntil = 0;
+  pumpOff();
   manualMode     = true;
   manualStart    = millis();
   manualDuration = (unsigned long)seconds * 1000UL;
-  pumpActive     = true;
-  pumpStart      = millis();
-  digitalWrite(PUMP_PIN, HIGH);
+  _pumpOn();
+}
+
+// =====================================================
+// CALIBRATION  (session-only — always 1024/294 on reboot)
+// =====================================================
+
+void handleCalibrateDry() {
+  int s = rawSample(20);
+  dryVal    = s;
+  smoothRaw = (float)s;
+  Serial.printf("[CAL] Session dry=%d\n", dryVal);
+  server.send(200, "text/plain", String(dryVal));
+}
+
+void handleCalibrateWet() {
+  int s = rawSample(20);
+  wetVal    = s;
+  smoothRaw = (float)s;
+  Serial.printf("[CAL] Session wet=%d\n", wetVal);
+  server.send(200, "text/plain", String(wetVal));
+}
+
+void handleCalibrateReset() {
+  dryVal    = 1024;
+  wetVal    = 294;
+  smoothRaw = (float)rawSample();
+  Serial.println(F("[CAL] Reset to defaults 1024/294"));
+  server.send(200, "text/plain", "RESET");
 }
 
 // =====================================================
@@ -218,35 +321,58 @@ void updateOLED() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
+  // Row 1 — plant name
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print(plants[selectedPlant].oledName);
 
+  // Row 2 — moisture %
   if (!sensorOK) {
     display.setTextSize(1);
-    display.setCursor(0, 18);
+    display.setCursor(0, 14);
     display.print("!! SENSOR ERROR !!");
   } else {
     display.setTextSize(2);
-    display.setCursor(0, 18);
-    display.print("Moist:");
+    display.setCursor(0, 12);
+    display.print("Mst:");
     display.print(moisturePct);
     display.print("%");
   }
 
+  // Row 3 — dry / wet / raw
   display.setTextSize(1);
-  display.setCursor(0, 42);
+  display.setCursor(0, 32);
   display.print("D:");
   display.print(dryVal);
-  display.setCursor(50, 42);
+  display.setCursor(48, 32);
   display.print("W:");
   display.print(wetVal);
-  display.setCursor(95, 42);
+  display.setCursor(94, 32);
   display.print("R:");
   display.print(moistureRaw);
 
+  // Row 4 — pump state / soak countdown
+  display.setCursor(0, 44);
+  if (pumpActive) {
+    display.print("PUMP ON ");
+    display.print(waterCycle == 0 ? "10s" : "5s");
+  } else if (millis() < pumpPauseUntil) {
+    unsigned long rem = (pumpPauseUntil - millis()) / 1000;
+    unsigned long m   = rem / 60;
+    unsigned long s   = rem % 60;
+    display.print("Soak ");
+    display.print(m);
+    display.print("m");
+    display.print(s);
+    display.print("s");
+  } else {
+    display.print("PUMP OFF");
+  }
+
+  // Row 5 — total pump working time
   display.setCursor(0, 56);
-  display.print(pumpActive ? "PUMP ON" : "PUMP OFF");
+  display.print("Run:");
+  display.print(formatTime(totalPumpSeconds()));
 
   display.display();
 }
@@ -256,54 +382,25 @@ void updateOLED() {
 // =====================================================
 
 void handleData() {
+  unsigned long pauseRem = (millis() < pumpPauseUntil)
+                           ? (pumpPauseUntil - millis()) / 1000
+                           : 0;
+
   String json = "{";
-  json += "\"moist\":"  + String(moisturePct)  + ",";
-  json += "\"raw\":"    + String(moistureRaw)   + ",";
-  json += "\"dry\":"    + String(dryVal)         + ",";
-  json += "\"wet\":"    + String(wetVal)         + ",";
-  json += "\"plant\":"  + String(selectedPlant) + ",";
-  json += "\"minM\":"   + String(plants[selectedPlant].minMoisture) + ",";
-  json += "\"ok\":";
-  json += (sensorOK ? "true" : "false");
-  json += ",";
-  json += "\"pump\":";
-  json += (pumpActive ? "true" : "false");
+  json += "\"moist\":"    + String(moisturePct)   + ",";
+  json += "\"raw\":"      + String(moistureRaw)    + ",";
+  json += "\"dry\":"      + String(dryVal)          + ",";
+  json += "\"wet\":"      + String(wetVal)          + ",";
+  json += "\"plant\":"    + String(selectedPlant)  + ",";
+  json += "\"minM\":"     + String(plants[selectedPlant].minMoisture) + ",";
+  json += "\"ok\":"       + (sensorOK   ? "true" : "false") + ",";
+  json += "\"pump\":"     + (pumpActive ? "true" : "false") + ",";
+  json += "\"cycle\":"    + String(waterCycle)     + ",";
+  json += "\"pauseRem\":" + String(pauseRem)       + ",";
+  json += "\"workSec\":"  + String(totalPumpSeconds()) + ",";
+  json += "\"uptime\":"   + String(millis() / 1000);
   json += "}";
   server.send(200, "application/json", json);
-}
-
-// =====================================================
-// CALIBRATION HANDLERS
-// =====================================================
-
-// Call while sensor is in completely dry air / dry soil
-void handleCalibrateDry() {
-  int sample = rawSample(20);   // more samples = more stable
-  dryVal    = sample;
-  smoothRaw = (float)sample;   // reset filter to avoid stale offset
-  eepromSave();
-  Serial.printf("[CAL] New dry=%d\n", dryVal);
-  server.send(200, "text/plain", String(dryVal));
-}
-
-// Call while sensor is fully submerged in water
-void handleCalibrateWet() {
-  int sample = rawSample(20);
-  wetVal    = sample;
-  smoothRaw = (float)sample;
-  eepromSave();
-  Serial.printf("[CAL] New wet=%d\n", wetVal);
-  server.send(200, "text/plain", String(wetVal));
-}
-
-// Reset to factory defaults
-void handleCalibrateReset() {
-  dryVal = 1024;
-  wetVal = 294;
-  smoothRaw = (float)rawSample();
-  eepromSave();
-  Serial.println(F("[CAL] Reset to defaults"));
-  server.send(200, "text/plain", "RESET");
 }
 
 // =====================================================
@@ -325,11 +422,10 @@ void handlePlantSelect() {
   if (server.hasArg("id")) {
     int id = server.arg("id").toInt();
     if (id >= 0 && id < PLANT_COUNT) {
-      if (pumpActive && !manualMode) {
-        pumpActive = false;
-        digitalWrite(PUMP_PIN, LOW);
-      }
-      selectedPlant = id;
+      if (pumpActive && !manualMode) pumpOff();
+      selectedPlant  = id;
+      waterCycle     = 0;
+      pumpPauseUntil = 0;
     }
   }
   server.send(200, "text/plain", "OK");
@@ -350,13 +446,18 @@ void handleRoot() {
   const float CIRC   = 471.24f;
   float       offset = sensorOK ? CIRC * (1.0f - moisturePct / 100.0f) : CIRC;
 
-  String pumpCls = pumpActive ? "on"          : "off";
-  String pumpTxt = pumpActive ? "Pump ACTIVE" : "Pump STOPPED";
+  String pumpCls = pumpActive ? "on" : "off";
+  String pumpTxt = pumpActive
+    ? (waterCycle == 0 ? "Watering 10s..." : "Follow-up 5s...")
+    : "Pump STOPPED";
+
+  unsigned long pauseRemSec = (millis() < pumpPauseUntil)
+                              ? (pumpPauseUntil - millis()) / 1000 : 0;
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html; charset=utf-8", "");
 
-  // ── CHUNK 1: HEAD + CSS ─────────────────────────────────────
+  // ── CHUNK 1: HEAD + CSS ──────────────────────────────────────
   server.sendContent(F(
     "<!DOCTYPE html><html><head>"
     "<meta charset='UTF-8'>"
@@ -369,13 +470,14 @@ void handleRoot() {
       "background-image:radial-gradient(ellipse at 15% 0%,#0f2417 0%,transparent 55%),"
         "radial-gradient(ellipse at 85% 100%,#0a1c10 0%,transparent 55%);}"
     ".wrap{max-width:440px;margin:auto}"
-    // header
     ".hdr{display:flex;align-items:baseline;gap:10px;margin-bottom:4px}"
-    "h1{font-family:Georgia,serif;font-size:38px;font-style:italic;color:#4ade80;letter-spacing:2px;line-height:1}"
+    "h1{font-family:Georgia,serif;font-size:38px;font-style:italic;color:#4ade80;"
+       "letter-spacing:2px;line-height:1}"
     ".badge{background:#0d2b17;border:1px solid #1e4228;color:#4ade80;font-size:9px;"
       "letter-spacing:2px;text-transform:uppercase;padding:3px 9px;border-radius:99px}"
-    ".sub{font-size:10px;color:#3a6647;letter-spacing:3px;text-transform:uppercase;margin-bottom:16px}"
-    // plant grid
+    ".sub{font-size:10px;color:#3a6647;letter-spacing:3px;text-transform:uppercase;"
+         "margin-bottom:16px}"
+    /* plant grid */
     ".plants{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px}"
     ".pb{border:1.5px solid #1a3322;background:transparent;color:#3a6647;"
       "border-radius:12px;font-family:'Trebuchet MS',sans-serif;"
@@ -387,34 +489,45 @@ void handleRoot() {
     ".pb.active{border-color:#4ade80;color:#4ade80;"
       "background:rgba(74,222,128,.07);box-shadow:0 0 12px rgba(74,222,128,.06)}"
     ".pb.active .thr{color:#2d7a42}"
-    // cards
-    ".gcard,.ccard,.calcard{background:#0c1a11;border:1px solid #1a3322;"
+    /* cards */
+    ".gcard,.ccard,.calcard,.statcard{background:#0c1a11;border:1px solid #1a3322;"
       "border-radius:20px;padding:18px 14px 12px;margin-bottom:12px;text-align:center}"
-    ".ccard,.calcard{text-align:left}"
+    ".ccard,.calcard,.statcard{text-align:left}"
     "svg.ring{display:block;margin:auto}"
     "#arc{transition:stroke-dashoffset 1.2s ease,stroke .6s}"
-    // pill
+    /* pill */
     ".pill{display:inline-flex;align-items:center;gap:8px;"
       "padding:7px 18px;border-radius:99px;font-size:13px;font-weight:bold;margin-top:10px}"
-    ".pill.on{background:rgba(74,222,128,.1);color:#4ade80;border:1px solid rgba(74,222,128,.25)}"
-    ".pill.off{background:rgba(251,146,60,.07);color:#fb923c;border:1px solid rgba(251,146,60,.2)}"
-    ".pill.err{background:rgba(168,85,247,.1);color:#a855f7;border:1px solid rgba(168,85,247,.25)}"
+    ".pill.on  {background:rgba(74,222,128,.10);color:#4ade80;"
+               "border:1px solid rgba(74,222,128,.25)}"
+    ".pill.off {background:rgba(251,146,60,.07);color:#fb923c;"
+               "border:1px solid rgba(251,146,60,.20)}"
+    ".pill.soak{background:rgba(56,189,248,.07);color:#38bdf8;"
+               "border:1px solid rgba(56,189,248,.20)}"
+    ".pill.err {background:rgba(168,85,247,.10);color:#a855f7;"
+               "border:1px solid rgba(168,85,247,.25)}"
     ".dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}"
-    ".dot.on{background:#4ade80;box-shadow:0 0 6px #4ade80;animation:pulse 1.4s infinite}"
-    ".dot.off{background:#fb923c}"
-    ".dot.err{background:#a855f7;box-shadow:0 0 6px #a855f7;animation:pulse 1s infinite}"
+    ".dot.on  {background:#4ade80;box-shadow:0 0 6px #4ade80;animation:pulse 1.4s infinite}"
+    ".dot.off {background:#fb923c}"
+    ".dot.soak{background:#38bdf8;animation:pulse 2s infinite}"
+    ".dot.err {background:#a855f7;box-shadow:0 0 6px #a855f7;animation:pulse 1s infinite}"
     "@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}"
-    // buttons
+    /* soak countdown bar */
+    ".soakbar{background:#080e18;border:1px solid #0d1e2a;border-radius:12px;"
+      "padding:10px 14px;margin-top:10px;font-size:11px;color:#38bdf8;"
+      "text-align:center;display:none}"
+    ".soakbar.vis{display:block}"
+    /* stat card */
     ".clabel{font-size:10px;letter-spacing:2.5px;color:#3a6647;"
       "text-transform:uppercase;margin-bottom:12px}"
-    ".btns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}"
-    ".btn{padding:14px 8px;border:none;border-radius:13px;"
-      "font-family:'Trebuchet MS',sans-serif;font-size:13px;font-weight:bold;"
-      "cursor:pointer;transition:transform .12s,opacity .2s;width:100%}"
-    ".btn:active{transform:scale(.96);opacity:.75}"
-    ".btn-on{background:#4ade80;color:#061009}"
-    ".btn-off{background:#111f15;color:#f87171;border:1.5px solid rgba(248,113,113,.2)}"
-    // calibration buttons
+    ".statrow{display:flex;gap:8px;margin-bottom:4px}"
+    ".stat{flex:1;background:#080f0b;border:1px solid #111d15;"
+      "border-radius:10px;padding:10px;text-align:center}"
+    ".stat .slbl{font-size:9px;letter-spacing:2px;color:#2a4a33;"
+      "text-transform:uppercase;margin-bottom:4px}"
+    ".stat .sval{font-size:15px;font-family:Georgia,serif;font-style:italic;color:#4ade80}"
+    ".stat.warn .sval{color:#fb923c}"
+    /* calibration */
     ".cal-btns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}"
     ".btn-dry{background:#111508;color:#a3e635;border:1.5px solid rgba(163,230,53,.25);"
       "padding:12px 8px;border-radius:13px;font-family:'Trebuchet MS',sans-serif;"
@@ -427,7 +540,6 @@ void handleRoot() {
       "padding:8px;border-radius:10px;font-family:'Trebuchet MS',sans-serif;"
       "font-size:11px;cursor:pointer;width:100%;margin-top:4px;transition:transform .12s}"
     ".btn-rst:active{transform:scale(.97)}"
-    // cal values bar
     ".calbar{display:flex;gap:8px;margin-bottom:10px}"
     ".calval{flex:1;background:#080f0b;border:1px solid #111d15;border-radius:10px;"
       "padding:8px 10px;text-align:center}"
@@ -436,9 +548,15 @@ void handleRoot() {
       "color:#3a6647;margin-top:2px}"
     ".calval.active-dry .num{color:#a3e635}"
     ".calval.active-wet .num{color:#38bdf8}"
-    // cal hint
     ".hint{font-size:10px;color:#2a4a33;margin-top:8px;line-height:1.5;text-align:center}"
-    // timer row
+    /* pump controls */
+    ".btns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}"
+    ".btn{padding:14px 8px;border:none;border-radius:13px;"
+      "font-family:'Trebuchet MS',sans-serif;font-size:13px;font-weight:bold;"
+      "cursor:pointer;transition:transform .12s,opacity .2s;width:100%}"
+    ".btn:active{transform:scale(.96);opacity:.75}"
+    ".btn-on {background:#4ade80;color:#061009}"
+    ".btn-off{background:#111f15;color:#f87171;border:1.5px solid rgba(248,113,113,.2)}"
     ".trow{display:flex;gap:8px}"
     ".trow input{flex:1;background:#080f0b;border:1.5px solid #1a3322;"
       "border-radius:11px;color:#d4f5dc;padding:12px 14px;"
@@ -451,20 +569,18 @@ void handleRoot() {
       "cursor:pointer;white-space:nowrap;transition:transform .12s}"
     ".btn-t:active{transform:scale(.96)}"
     ".note{text-align:center;font-size:11px;color:#2a5035;margin-top:12px}"
-    // raw bar
     ".rawbar{display:flex;justify-content:space-between;margin-top:12px;"
       "padding:9px 14px;background:#080f0b;border:1px solid #111d15;"
       "border-radius:12px;font-size:9px;color:#1e3a24;"
       "letter-spacing:1px;text-transform:uppercase}"
     ".warn{color:#a855f7!important}"
-    // flash overlay for cal feedback
     "#flash{position:fixed;top:16px;left:50%;transform:translateX(-50%);"
       "padding:10px 22px;border-radius:99px;font-size:13px;font-weight:bold;"
       "opacity:0;transition:opacity .3s;pointer-events:none;z-index:99}"
     "</style></head><body><div class='wrap'>"
   ));
 
-  // ── CHUNK 2: HEADER ─────────────────────────────────────────
+  // ── CHUNK 2: HEADER ──────────────────────────────────────────
   server.sendContent(F(
     "<div id='flash'></div>"
     "<div class='hdr'><h1>Kwtsos</h1>"
@@ -487,7 +603,7 @@ void handleRoot() {
     server.sendContent(pb);
   }
 
-  // ── CHUNK 4: GAUGE ───────────────────────────────────────────
+  // ── CHUNK 4: GAUGE + SOAK BAR ────────────────────────────────
   {
     String gc = "<div class='gcard'>";
     gc += "<svg class='ring' width='180' height='180' viewBox='0 0 180 180'>";
@@ -507,8 +623,7 @@ void handleRoot() {
     gc += "<text id='gname' x='90' y='120' text-anchor='middle' fill='#1e4228'"
           " font-family='Trebuchet MS,sans-serif' font-size='9'>";
     gc += plants[selectedPlant].name;
-    gc += "</text>";
-    gc += "</svg>";
+    gc += "</text></svg>";
 
     String cls = sensorOK ? pumpCls : "err";
     String txt = sensorOK ? pumpTxt : "Sensor Error";
@@ -516,63 +631,102 @@ void handleRoot() {
     gc += "<span class='dot " + cls + "' id='dot'></span>";
     gc += "<span id='pstatus'>" + txt + "</span>";
     gc += "</span></div>";
+
+    // Soak countdown
+    String soakVis = (pauseRemSec > 0 && !pumpActive) ? " vis" : "";
+    gc += "<div class='soakbar" + soakVis + "' id='soakbar'>";
+    gc += "&#128167; Soaking — next check in <span id='soakcnt'>";
+    gc += String(pauseRemSec);
+    gc += "</span>s</div>";
+
     gc += "</div>"; // .gcard
     server.sendContent(gc);
   }
 
-  // ── CHUNK 5: CALIBRATION CARD ────────────────────────────────
+  // ── CHUNK 5: STATS CARD ──────────────────────────────────────
+  {
+    unsigned long warnThresholdH = 100; // flag if pump ran > 100 hours total
+    bool workWarn = totalPumpSeconds() > warnThresholdH * 3600UL;
+
+    String sc = "<div class='statcard'>";
+    sc += "<div class='clabel'>System Stats</div>";
+    sc += "<div class='statrow'>";
+
+    // Pump working time
+    sc += "<div class='stat" + String(workWarn ? " warn" : "") + "'>";
+    sc += "<div class='slbl'>Pump Run Time</div>";
+    sc += "<div class='sval' id='worktime'>" + formatTime(totalPumpSeconds()) + "</div></div>";
+
+    // Uptime
+    sc += "<div class='stat'><div class='slbl'>Uptime</div>";
+    sc += "<div class='sval' id='uptimeval'>" + formatTime(millis() / 1000) + "</div></div>";
+
+    // Water cycle state
+    sc += "<div class='stat'><div class='slbl'>Next Burst</div>";
+    sc += "<div class='sval' id='cyclestat'>";
+    if (pumpActive)             sc += waterCycle == 0 ? "10s NOW" : "5s NOW";
+    else if (pauseRemSec > 0)   sc += waterCycle == 1 ? "5s top-up" : "10s fresh";
+    else                        sc += waterCycle == 0 ? "10s fresh" : "5s top-up";
+    sc += "</div></div>";
+
+    sc += "</div></div>"; // .statrow + .statcard
+    server.sendContent(sc);
+  }
+
+  // ── CHUNK 6: CALIBRATION CARD ────────────────────────────────
   {
     String cc = "<div class='calcard'>";
-    cc += "<div class='clabel'>Sensor Calibration</div>";
-
-    // current dry / wet / raw values
+    cc += "<div class='clabel'>Sensor Calibration";
+    cc += "<span style='color:#1e3a24;font-size:9px;margin-left:8px'>"
+          "session-only &mdash; 1024/294 on reboot</span></div>";
     cc += "<div class='calbar'>";
-    cc += "<div class='calval' id='cv-dry'><div class='lbl'>DRY</div><div class='num' id='cv-dry-n'>" + String(dryVal) + "</div></div>";
-    cc += "<div class='calval' id='cv-raw'><div class='lbl'>RAW NOW</div><div class='num' id='cv-raw-n'>" + String(moistureRaw) + "</div></div>";
-    cc += "<div class='calval' id='cv-wet'><div class='lbl'>WET</div><div class='num' id='cv-wet-n'>" + String(wetVal) + "</div></div>";
+    cc += "<div class='calval' id='cv-dry'><div class='lbl'>DRY</div>"
+          "<div class='num' id='cv-dry-n'>" + String(dryVal) + "</div></div>";
+    cc += "<div class='calval' id='cv-raw'><div class='lbl'>RAW NOW</div>"
+          "<div class='num' id='cv-raw-n'>" + String(moistureRaw) + "</div></div>";
+    cc += "<div class='calval' id='cv-wet'><div class='lbl'>WET</div>"
+          "<div class='num' id='cv-wet-n'>" + String(wetVal) + "</div></div>";
     cc += "</div>";
-
-    // calibration buttons
     cc += "<div class='cal-btns'>";
     cc += "<button class='btn-dry' onclick='calDry()'>&#9729; Set as DRY</button>";
     cc += "<button class='btn-wet' onclick='calWet()'>&#128167; Set as WET</button>";
     cc += "</div>";
-    cc += "<button class='btn-rst' onclick='calReset()'>&#8635; Reset to defaults (1024 / 294)</button>";
-
-    cc += "<div class='hint'>HOW TO:<br>";
-    cc += "1. Hold sensor in open air &rarr; press SET DRY<br>";
-    cc += "2. Submerge sensor tip in water &rarr; press SET WET<br>";
-    cc += "Saved to EEPROM &mdash; survives reboot.</div>";
-
-    cc += "</div>"; // .calcard
+    cc += "<button class='btn-rst' onclick='calReset()'>&#8635; Reset to defaults (1024/294)</button>";
+    cc += "<div class='hint'>1. Sensor in open air &rarr; SET DRY<br>"
+          "2. Sensor tip in water &rarr; SET WET<br>"
+          "Always starts at 1024/294 after reboot.</div>";
+    cc += "</div>";
     server.sendContent(cc);
   }
 
-  // ── CHUNK 6: PUMP CONTROLS ───────────────────────────────────
+  // ── CHUNK 7: PUMP CONTROLS ───────────────────────────────────
   server.sendContent(F(
     "<div class='ccard'>"
     "<div class='clabel'>Pump Control</div>"
     "<div class='btns'>"
-    "<button class='btn btn-on' onclick=\"cmd('/pump/on')\">&#128167; Pump ON</button>"
+    "<button class='btn btn-on'  onclick=\"cmd('/pump/on')\">&#128167; Pump ON</button>"
     "<button class='btn btn-off' onclick=\"cmd('/pump/off')\">&#128721; Pump OFF</button>"
     "</div>"
     "<div class='trow'>"
     "<input id='t' type='number' min='1' max='600' placeholder='Duration in seconds...'>"
-    "<button class='btn-t' onclick=\"cmd('/pump/timer?t='+document.getElementById('t').value)\">"
+    "<button class='btn-t'"
+      " onclick=\"cmd('/pump/timer?t='+document.getElementById('t').value)\">"
       "&#9201; Timer</button>"
     "</div>"
   ));
 
-  // ── CHUNK 7: NOTE + RAW BAR ──────────────────────────────────
+  // ── CHUNK 8: NOTE + RAW BAR ──────────────────────────────────
   {
-    String tail = "<div class='note' id='note'>Auto-water when moisture &lt; <b>";
+    String tail = "<div class='note' id='note'>";
+    tail += "Auto-water when moisture &lt; <b>";
     tail += plants[selectedPlant].minMoisture;
-    tail += "%</b> &bull; Plant: ";
-    tail += plants[selectedPlant].name;
+    tail += "%</b> &bull; 10s burst &rarr; soak 20&ndash;30 min &rarr; 5s top-up";
+    tail += " &bull; Plant: " + String(plants[selectedPlant].name);
     tail += "</div></div>"; // .note + .ccard
 
     tail += "<div class='rawbar'>";
-    tail += "<span id='rawv'" + String(!sensorOK ? " class='warn'" : "") + ">RAW " + String(moistureRaw) + "</span>";
+    tail += "<span id='rawv'" + String(!sensorOK ? " class='warn'" : "");
+    tail += ">RAW " + String(moistureRaw) + "</span>";
     tail += "<span>DRY " + String(dryVal) + "</span>";
     tail += "<span>WET " + String(wetVal) + "</span>";
     tail += "</div>";
@@ -580,7 +734,7 @@ void handleRoot() {
     server.sendContent(tail);
   }
 
-  // ── CHUNK 8: JS — dynamic arrays ────────────────────────────
+  // ── CHUNK 9: JS — dynamic arrays ─────────────────────────────
   {
     String js = "<script>const MINS=[";
     for (int i = 0; i < PLANT_COUNT; i++) {
@@ -589,40 +743,35 @@ void handleRoot() {
     }
     js += "];const NAMES=[";
     for (int i = 0; i < PLANT_COUNT; i++) {
-      js += "'";
-      js += plants[i].name;
-      js += "'";
+      js += "'"; js += plants[i].name; js += "'";
       if (i < PLANT_COUNT - 1) js += ",";
     }
     js += "];";
     server.sendContent(js);
   }
 
-  // ── CHUNK 9: JS — static logic ──────────────────────────────
+  // ── CHUNK 10: JS — static logic ──────────────────────────────
   server.sendContent(F(
     "const CIRC=471.24;"
 
-    // generic fetch + refresh
     "async function cmd(u){await fetch(u);ref();}"
 
-    // flash notification
     "function flash(msg,col){"
       "let f=document.getElementById('flash');"
-      "f.textContent=msg;"
-      "f.style.background=col||'#1a3322';"
-      "f.style.color='#4ade80';"
-      "f.style.opacity='1';"
+      "f.textContent=msg;f.style.background=col||'#1a3322';"
+      "f.style.color='#4ade80';f.style.opacity='1';"
       "setTimeout(()=>f.style.opacity='0',2200);"
     "}"
 
-    // plant selector
     "async function selp(id){"
       "document.querySelectorAll('.pb').forEach((b,i)=>{"
         "b.className='pb'+(i===id?' active':'');"
       "});"
       "document.getElementById('gname').textContent=NAMES[id];"
       "document.getElementById('note').innerHTML="
-        "'Auto-water when moisture &lt; <b>'+MINS[id]+'%</b> &bull; Plant: '+NAMES[id];"
+        "'Auto-water when moisture &lt; <b>'+MINS[id]"
+        "+'%</b> &bull; 10s burst &rarr; soak 20&ndash;30 min &rarr; 5s top-up"
+        " &bull; Plant: '+NAMES[id];"
       "await fetch('/plant?id='+id);"
     "}"
 
@@ -631,48 +780,72 @@ void handleRoot() {
       "let r=await fetch('/calibrate/dry');"
       "if(r.ok){let v=await r.text();"
         "document.getElementById('cv-dry-n').textContent=v;"
-        "flash('DRY saved: '+v,'#0f2010');"
-        "ref();"
+        "flash('DRY set: '+v,'#0f2010');ref();"
       "}else flash('Sensor error!','#1a0808');"
     "}"
     "async function calWet(){"
       "let r=await fetch('/calibrate/wet');"
       "if(r.ok){let v=await r.text();"
         "document.getElementById('cv-wet-n').textContent=v;"
-        "flash('WET saved: '+v,'#080e18');"
-        "ref();"
+        "flash('WET set: '+v,'#080e18');ref();"
       "}else flash('Sensor error!','#1a0808');"
     "}"
     "async function calReset(){"
       "await fetch('/calibrate/reset');"
       "document.getElementById('cv-dry-n').textContent='1024';"
       "document.getElementById('cv-wet-n').textContent='294';"
-      "flash('Reset to defaults','#111111');"
-      "ref();"
+      "flash('Reset to 1024/294','#111111');ref();"
+    "}"
+
+    // time formatter
+    "function fmtTime(s){"
+      "let h=Math.floor(s/3600);"
+      "let m=Math.floor((s%3600)/60);"
+      "let sec=s%60;"
+      "if(h>0)return h+'h '+String(m).padStart(2,'0')+'m '+String(sec).padStart(2,'0')+'s';"
+      "return m+'m '+String(sec).padStart(2,'0')+'s';"
     "}"
 
     // update all live elements
     "function setData(d){"
       "let ok=d.ok;"
-      "let c=!ok?'#a855f7':d.moist<20?'#f87171':d.moist<40?'#fb923c':d.moist<60?'#fbd34d':'#4ade80';"
+      "let c=!ok?'#a855f7':d.moist<20?'#f87171':d.moist<40?'#fb923c'"
+             ":d.moist<60?'#fbd34d':'#4ade80';"
+      // gauge arc
       "let arc=document.getElementById('arc');"
       "arc.style.strokeDashoffset=ok?CIRC*(1-d.moist/100):CIRC;"
       "arc.style.stroke=c;"
       "let pt=document.getElementById('pct');"
-      "pt.textContent=ok?d.moist+'%':'---';"
-      "pt.style.fill=c;"
-      "let cls=ok?(d.pump?'on':'off'):'err';"
-      "let txt=ok?(d.pump?'Pump ACTIVE':'Pump STOPPED'):'Sensor Error';"
+      "pt.textContent=ok?d.moist+'%':'---';pt.style.fill=c;"
+      // pump pill
+      "let soaking=!d.pump&&d.pauseRem>0;"
+      "let cls=!ok?'err':d.pump?'on':soaking?'soak':'off';"
+      "let txt=!ok?'Sensor Error':d.pump"
+        "?(d.cycle===0?'Watering 10s...':'Follow-up 5s...')"
+        ":soaking?'Soaking...':'Pump STOPPED';"
       "document.getElementById('pill').className='pill '+cls;"
       "document.getElementById('dot').className='dot '+cls;"
       "document.getElementById('pstatus').textContent=txt;"
-      // update raw bars
+      // soak countdown
+      "let sb=document.getElementById('soakbar');"
+      "let sc=document.getElementById('soakcnt');"
+      "if(soaking){sb.className='soakbar vis';sc.textContent=d.pauseRem;}"
+      "else sb.className='soakbar';"
+      // calibration values
       "document.getElementById('cv-raw-n').textContent=d.raw;"
       "document.getElementById('cv-dry-n').textContent=d.dry;"
       "document.getElementById('cv-wet-n').textContent=d.wet;"
       "let rv=document.getElementById('rawv');"
-      "rv.textContent='RAW '+d.raw;"
-      "rv.className=ok?'':'warn';"
+      "rv.textContent='RAW '+d.raw;rv.className=ok?'':'warn';"
+      // stats
+      "document.getElementById('worktime').textContent=fmtTime(d.workSec);"
+      "document.getElementById('uptimeval').textContent=fmtTime(d.uptime);"
+      // next burst label
+      "let nb='';"
+      "if(d.pump)            nb=d.cycle===0?'10s NOW':'5s NOW';"
+      "else if(d.pauseRem>0) nb=d.cycle===1?'5s top-up':'10s fresh';"
+      "else                  nb=d.cycle===0?'10s fresh':'5s top-up';"
+      "document.getElementById('cyclestat').textContent=nb;"
     "}"
 
     "async function ref(){"
@@ -697,11 +870,12 @@ void setup() {
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay();
 
-  EEPROM.begin(EEPROM_SIZE);
-  eepromLoad();   // overwrite defaults with saved calibration if present
+  // Calibration always resets to factory defaults on every boot
+  dryVal = 1024;
+  wetVal = 294;
 
-  // Seed smoothing filter with real reading after calibration is loaded
-  smoothRaw = (float)analogRead(MOISTURE_PIN);
+  randomSeed(analogRead(MOISTURE_PIN));          // seed RNG for soak randomisation
+  smoothRaw = (float)analogRead(MOISTURE_PIN);   // seed smoothing filter
 
   WiFi.softAP(AP_NAME, AP_PASS);
   MDNS.begin("kwtsos");
@@ -721,15 +895,14 @@ void setup() {
   Serial.println(F("\n=== Kwtsos Smart Farm ==="));
   Serial.printf("AP: %s  IP: %s  Plants: %d\n",
     AP_NAME, WiFi.softAPIP().toString().c_str(), PLANT_COUNT);
-  Serial.printf("Calibration: dry=%d  wet=%d\n", dryVal, wetVal);
+  Serial.println(F("Calibration: dry=1024 wet=294 (fixed defaults, resets every boot)"));
+  Serial.println(F("Watering: 10s burst -> 20-30min soak -> 5s top-up -> 25min cooldown"));
 }
 
 // =====================================================
 // LOOP
 // =====================================================
 
-#ifndef KWTSOS_LOOP_DEFINED
-#define KWTSOS_LOOP_DEFINED
 void loop() {
   server.handleClient();
   MDNS.update();
@@ -740,12 +913,18 @@ void loop() {
     controlPump();
     updateOLED();
 
-    Serial.printf("[%s] Moisture: %d%% (raw:%d dry:%d wet:%d) | Pump: %s%s\n",
+    unsigned long pauseRem = (millis() < pumpPauseUntil)
+                             ? (pumpPauseUntil - millis()) / 1000 : 0;
+
+    Serial.printf(
+      "[%s] Moist:%d%% raw:%d | Pump:%s cycle:%d soak_rem:%lus | RunTime:%s Uptime:%s\n",
       plants[selectedPlant].oledName,
-      moisturePct, moistureRaw, dryVal, wetVal,
-      pumpActive ? "ON"  : "OFF",
-      sensorOK   ? ""    : " *** SENSOR ERROR ***"
+      moisturePct, moistureRaw,
+      pumpActive ? "ON" : "OFF",
+      waterCycle,
+      pauseRem,
+      formatTime(totalPumpSeconds()).c_str(),
+      formatTime(millis() / 1000).c_str()
     );
   }
 }
-#endif
